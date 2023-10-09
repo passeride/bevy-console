@@ -19,9 +19,7 @@ use bevy_egui::{
     EguiContexts,
 };
 use clap::{builder::StyledStr, CommandFactory, FromArgMatches};
-use egui_autocomplete::AutoCompleteTextEdit;
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
-use search_autocompletion::AutoComplete;
 use shlex::Shlex;
 use std::marker::PhantomData;
 use std::mem;
@@ -44,36 +42,6 @@ impl<T: NamedCommand + CommandFactory + FromArgMatches + Sized + Resource> Comma
 pub trait NamedCommand {
     /// Return the unique command identifier (same as the command "executable")
     fn name() -> &'static str;
-}
-// Highlights all the match indices in the provided text
-fn highlight_matches(text: &&String, match_indices: &[usize], color: egui::Color32) -> LayoutJob {
-    let mut formatted = LayoutJob::default();
-    let mut it = (0..text.len()).peekable();
-    // Iterate through all indices in the string
-    while let Some(j) = it.next() {
-        let start = j;
-        let mut end = j;
-        let match_state = match_indices.contains(&start);
-        // Find all consecutive characters that have the same state
-        while let Some(k) = it.peek() {
-            if match_state == match_indices.contains(k) {
-                end += 1;
-                // Advance the iterator, we already peeked the value so it is fine to ignore
-                _ = it.next();
-            } else {
-                break;
-            }
-        }
-        // Format current slice based on the state
-        let format = if match_state {
-            egui::TextFormat::simple(FontId::default(), color)
-        } else {
-            egui::TextFormat::default()
-        };
-        let slice = &text[start..=end];
-        formatted.append(slice, 0.0, format);
-    }
-    formatted
 }
 
 /// Executed parsed console command.
@@ -195,7 +163,6 @@ unsafe impl<T: Command> SystemParam for ConsoleCommand<'_, T> {
         let command = event_reader.iter().find_map(|command| {
             if T::name() == command.command_name {
                 let clap_command = T::command().no_binary_name(true);
-                // .color(clap::ColorChoice::Always);
                 let arg_matches = clap_command.try_get_matches_from(command.args.iter());
 
                 debug!(
@@ -443,7 +410,10 @@ pub(crate) fn console_ui(
 
                 let text_edit_ui = ui.next_auto_id();
 
-                let mut layouter = |ui: &egui::Ui, string: &str, wrap_width: f32| {
+                let mut layouter = |ui: &egui::Ui, string: &str, _wrap_width: f32| {
+                    if string.is_empty() {
+                        return ui.fonts(|f| f.layout_job(LayoutJob::default()));
+                    }
                     let mut match_results = possible_commands
                         .iter()
                         .filter_map(|s| {
@@ -451,7 +421,6 @@ pub(crate) fn console_ui(
                             score.map(|(score, indices)| (s, score, indices))
                         })
                         .collect::<Vec<_>>();
-                    info!("match_results: {:?}", match_results);
                     match_results.sort_by_key(|k| Reverse(k.1));
 
                     let mut job = LayoutJob::default();
