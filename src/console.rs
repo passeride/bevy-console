@@ -1,11 +1,17 @@
-use bevy::ecs::{
-    component::Tick,
-    schedule::IntoSystemConfigs,
-    system::{Resource, SystemMeta, SystemParam},
-    world::unsafe_world_cell::UnsafeWorldCell,
+use bevy::{
+    app::AppLabel,
+    ecs::{
+        component::Tick,
+        schedule::IntoSystemConfigs,
+        system::{Resource, SystemMeta, SystemParam},
+        world::unsafe_world_cell::UnsafeWorldCell,
+    },
+    ui,
 };
 use bevy::{input::keyboard::KeyboardInput, prelude::*};
-use bevy_egui::egui::{self, Align, ScrollArea, TextEdit};
+use bevy_egui::egui::{
+    self, popup_below_widget, Align, Layout, Pos2, Rect, ScrollArea, TextEdit, Vec2,
+};
 use bevy_egui::egui::{text::LayoutJob, text_edit::CCursorRange};
 use bevy_egui::egui::{Context, Id};
 use bevy_egui::{
@@ -13,10 +19,16 @@ use bevy_egui::{
     EguiContexts,
 };
 use clap::{builder::StyledStr, CommandFactory, FromArgMatches};
+use egui_autocomplete::AutoCompleteTextEdit;
+use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
+use search_autocompletion::AutoComplete;
 use shlex::Shlex;
-use std::collections::{BTreeMap, VecDeque};
 use std::marker::PhantomData;
 use std::mem;
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, VecDeque},
+};
 
 use crate::ConsoleSet;
 
@@ -32,6 +44,36 @@ impl<T: NamedCommand + CommandFactory + FromArgMatches + Sized + Resource> Comma
 pub trait NamedCommand {
     /// Return the unique command identifier (same as the command "executable")
     fn name() -> &'static str;
+}
+// Highlights all the match indices in the provided text
+fn highlight_matches(text: &&String, match_indices: &[usize], color: egui::Color32) -> LayoutJob {
+    let mut formatted = LayoutJob::default();
+    let mut it = (0..text.len()).peekable();
+    // Iterate through all indices in the string
+    while let Some(j) = it.next() {
+        let start = j;
+        let mut end = j;
+        let match_state = match_indices.contains(&start);
+        // Find all consecutive characters that have the same state
+        while let Some(k) = it.peek() {
+            if match_state == match_indices.contains(k) {
+                end += 1;
+                // Advance the iterator, we already peeked the value so it is fine to ignore
+                _ = it.next();
+            } else {
+                break;
+            }
+        }
+        // Format current slice based on the state
+        let format = if match_state {
+            egui::TextFormat::simple(FontId::default(), color)
+        } else {
+            egui::TextFormat::default()
+        };
+        let slice = &text[start..=end];
+        formatted.append(slice, 0.0, format);
+    }
+    formatted
 }
 
 /// Executed parsed console command.
@@ -312,6 +354,7 @@ pub(crate) struct ConsoleState {
     pub(crate) scrollback: Vec<StyledStr>,
     pub(crate) history: VecDeque<StyledStr>,
     pub(crate) history_index: usize,
+    pub(crate) selected_index: Option<usize>,
 }
 
 impl Default for ConsoleState {
@@ -321,6 +364,7 @@ impl Default for ConsoleState {
             scrollback: Vec::new(),
             history: VecDeque::from([StyledStr::new()]),
             history_index: 0,
+            selected_index: None,
         }
     }
 }
@@ -347,132 +391,200 @@ pub(crate) fn console_ui(
         console_open.open = !console_open.open;
     }
 
-    if console_open.open {
-        egui::Window::new("Console")
-            .collapsible(false)
-            .default_pos([config.left_pos, config.top_pos])
-            .default_size([config.width, config.height])
-            .resizable(true)
-            .show(ctx, |ui| {
-                ui.vertical(|ui| {
-                    let scroll_height = ui.available_height() - 30.0;
+    if !console_open.open {
+        return;
+    }
+    egui::Window::new("Console")
+        .collapsible(false)
+        .default_pos([config.left_pos, config.top_pos])
+        .default_size([config.width, config.height])
+        .resizable(true)
+        .show(ctx, |ui| {
+            ui.vertical(|ui| {
+                let scroll_height = ui.available_height() - 80.0;
 
-                    // Scroll area
-                    ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .stick_to_bottom(true)
-                        .max_height(scroll_height)
-                        .show(ui, |ui| {
-                            ui.vertical(|ui| {
-                                for line in &state.scrollback {
-                                    let mut text = LayoutJob::default();
+                // Scroll area
+                ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .max_height(scroll_height)
+                    .show(ui, |ui| {
+                        ui.vertical(|ui| {
+                            for line in &state.scrollback {
+                                let mut text = LayoutJob::default();
 
-                                    text.append(
-                                        &line.to_string(), //TOOD: once clap supports custom styling use it here
-                                        0f32,
-                                        TextFormat::simple(FontId::monospace(14f32), Color32::GRAY),
-                                    );
+                                text.append(
+                                    &line.to_string(), //TOOD: once clap supports custom styling use it here
+                                    0f32,
+                                    TextFormat::simple(FontId::monospace(14f32), Color32::GRAY),
+                                );
 
-                                    ui.label(text);
-                                }
-                            });
-
-                            // Scroll to bottom if console just opened
-                            if console_open.is_changed() {
-                                ui.scroll_to_cursor(Some(Align::BOTTOM));
+                                ui.label(text);
                             }
                         });
 
-                    // Separator
-                    ui.separator();
-
-                    // Input
-                    let text_edit = TextEdit::singleline(&mut state.buf)
-                        .desired_width(f32::INFINITY)
-                        .lock_focus(true)
-                        .font(egui::TextStyle::Monospace);
-
-                    // Handle enter
-                    let text_edit_response = ui.add(text_edit);
-                    if text_edit_response.lost_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                    {
-                        if state.buf.trim().is_empty() {
-                            state.scrollback.push(StyledStr::new());
-                        } else {
-                            let msg = format!("{}{}", config.symbol, state.buf);
-                            state.scrollback.push(msg.into());
-                            let cmd_string = state.buf.clone();
-                            state.history.insert(1, cmd_string.into());
-                            if state.history.len() > config.history_size + 1 {
-                                state.history.pop_back();
-                            }
-
-                            let mut args = Shlex::new(&state.buf).collect::<Vec<_>>();
-
-                            if !args.is_empty() {
-                                let command_name = args.remove(0);
-                                debug!("Command entered: `{command_name}`, with args: `{args:?}`");
-
-                                let command = config.commands.get(command_name.as_str());
-
-                                if command.is_some() {
-                                    command_entered
-                                        .send(ConsoleCommandEntered { command_name, args });
-                                } else {
-                                    debug!(
-                                        "Command not recognized, recognized commands: `{:?}`",
-                                        config.commands.keys().collect::<Vec<_>>()
-                                    );
-
-                                    state.scrollback.push("error: Invalid command".into());
-                                }
-                            }
-
-                            state.buf.clear();
+                        // Scroll to bottom if console just opened
+                        if console_open.is_changed() {
+                            ui.scroll_to_cursor(Some(Align::BOTTOM));
                         }
-                    }
+                    });
 
-                    // Clear on ctrl+l
-                    if keyboard_input_events
+                // Separator
+                ui.separator();
+
+                let possible_commands = config
+                    .commands
+                    .keys()
+                    .copied()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<String>>();
+
+                let matcher = SkimMatcherV2::default().ignore_case();
+
+                let text_edit_ui = ui.next_auto_id();
+
+                let mut layouter = |ui: &egui::Ui, string: &str, wrap_width: f32| {
+                    let mut match_results = possible_commands
                         .iter()
-                        .any(|&k| k.state.is_pressed() && k.key_code == Some(KeyCode::L))
-                        && (keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]))
-                    {
-                        state.scrollback.clear();
+                        .filter_map(|s| {
+                            let score = matcher.fuzzy_indices(s, string);
+                            score.map(|(score, indices)| (s, score, indices))
+                        })
+                        .collect::<Vec<_>>();
+                    info!("match_results: {:?}", match_results);
+                    match_results.sort_by_key(|k| Reverse(k.1));
+
+                    let mut job = LayoutJob::default();
+                    if let Some((first_str, _, _)) = match_results.first() {
+                        let mut it = (0..first_str.len()).peekable();
+                        // // Iterate through all indices in the string
+                        while let Some(j) = it.next() {
+                            let start = j;
+                            let end = j;
+                            // let match_state = first_str.contains(&state.buf);
+                            // Find all consecutive characters that have the same state
+                            // Format current slice based on the state
+                            let format = if j > string.len() {
+                                egui::TextFormat::simple(
+                                    FontId::default(),
+                                    egui::Color32::from_gray(80),
+                                )
+                            } else {
+                                egui::TextFormat::default()
+                            };
+
+                            let slice = &first_str[start..=end];
+                            job.append(slice, 0.0, format);
+                        }
+                    } else {
+                        job.append(string, 0.0, egui::TextFormat::default());
                     }
 
-                    // Handle up and down through history
-                    if text_edit_response.has_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::ArrowUp))
-                        && state.history.len() > 1
-                        && state.history_index < state.history.len() - 1
-                    {
-                        if state.history_index == 0 && !state.buf.trim().is_empty() {
-                            *state.history.get_mut(0).unwrap() = state.buf.clone().into();
+                    set_cursor_pos(ui.ctx(), text_edit_ui, string.len());
+                    ui.fonts(|f| f.layout_job(job))
+                };
+
+                // Input
+                let text_edit = TextEdit::singleline(&mut state.buf)
+                    .layouter(&mut layouter)
+                    .id(text_edit_ui)
+                    .desired_width(f32::INFINITY)
+                    .lock_focus(true)
+                    .cursor_at_end(false)
+                    .font(egui::TextStyle::Monospace);
+
+                let text_edit_response = ui.add(text_edit);
+
+                if text_edit_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                {
+                    if state.buf.trim().is_empty() {
+                        state.scrollback.push(StyledStr::new());
+                    } else {
+                        let msg = format!("{}{}", config.symbol, state.buf);
+                        state.scrollback.push(msg.into());
+                        let cmd_string = state.buf.clone();
+                        state.history.insert(1, cmd_string.into());
+                        if state.history.len() > config.history_size + 1 {
+                            state.history.pop_back();
                         }
 
-                        state.history_index += 1;
-                        let previous_item = state.history.get(state.history_index).unwrap().clone();
-                        state.buf = previous_item.to_string();
+                        let mut args = Shlex::new(&state.buf).collect::<Vec<_>>();
 
-                        set_cursor_pos(ui.ctx(), text_edit_response.id, state.buf.len());
-                    } else if text_edit_response.has_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::ArrowDown))
-                        && state.history_index > 0
-                    {
-                        state.history_index -= 1;
-                        let next_item = state.history.get(state.history_index).unwrap().clone();
-                        state.buf = next_item.to_string();
+                        if !args.is_empty() {
+                            let command_name = args.remove(0);
+                            debug!("Command entered: `{command_name}`, with args: `{args:?}`");
 
-                        set_cursor_pos(ui.ctx(), text_edit_response.id, state.buf.len());
+                            let command = config.commands.get(command_name.as_str());
+
+                            if command.is_some() {
+                                command_entered.send(ConsoleCommandEntered { command_name, args });
+                            } else {
+                                debug!(
+                                    "Command not recognized, recognized commands: `{:?}`",
+                                    config.commands.keys().collect::<Vec<_>>()
+                                );
+
+                                state.scrollback.push("error: Invalid command".into());
+                            }
+                        }
+
+                        state.buf.clear();
                     }
+                }
 
-                    // Focus on input
-                    ui.memory_mut(|m| m.request_focus(text_edit_response.id));
-                });
+                if text_edit_response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Tab)) {
+                    let mut match_results = possible_commands
+                        .iter()
+                        .filter_map(|s| {
+                            let score = matcher.fuzzy_indices(s, &state.buf);
+                            score.map(|(score, indices)| (s, score, indices))
+                        })
+                        .collect::<Vec<_>>();
+                    match_results.sort_by_key(|k| Reverse(k.1));
+
+                    state.buf = match_results.first().unwrap().0.to_string();
+                    set_cursor_pos(ui.ctx(), text_edit_ui, state.buf.len());
+                }
+
+                // Clear on ctrl+l
+                if keyboard_input_events
+                    .iter()
+                    .any(|&k| k.state.is_pressed() && k.key_code == Some(KeyCode::L))
+                    && (keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]))
+                {
+                    state.scrollback.clear();
+                }
+
+                // Handle up and down through history
+                // if text_edit_response.has_focus()
+                //     && ui.input(|i| i.key_pressed(egui::Key::ArrowUp))
+                //     && state.history.len() > 1
+                //     && state.history_index < state.history.len() - 1
+                // {
+                //     if state.history_index == 0 && !state.buf.trim().is_empty() {
+                //         *state.history.get_mut(0).unwrap() = state.buf.clone().into();
+                //     }
+
+                //     state.history_index += 1;
+                //     let previous_item = state.history.get(state.history_index).unwrap().clone();
+                //     state.buf = previous_item.to_string();
+
+                //     set_cursor_pos(ui.ctx(), text_edit_response.id, state.buf.len());
+                // } else if text_edit_response.has_focus()
+                //     && ui.input(|i| i.key_pressed(egui::Key::ArrowDown))
+                //     && state.history_index > 0
+                // {
+                //     state.history_index -= 1;
+                //     let next_item = state.history.get(state.history_index).unwrap().clone();
+                //     state.buf = next_item.to_string();
+
+                //     set_cursor_pos(ui.ctx(), text_edit_response.id, state.buf.len());
+                // }
+
+                // Focus on input
+                // ui.memory_mut(|m| m.request_focus(text_edit_response.id));
             });
-    }
+        });
 }
 
 pub(crate) fn receive_console_line(
