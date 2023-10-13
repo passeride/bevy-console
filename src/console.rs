@@ -10,7 +10,7 @@ use bevy::{
 };
 use bevy::{input::keyboard::KeyboardInput, prelude::*};
 use bevy_egui::egui::{
-    self, popup_below_widget, Align, Layout, Pos2, Rect, ScrollArea, TextEdit, Vec2,
+    self, popup_below_widget, Align, Layout, Pos2, Rect, RichText, ScrollArea, TextEdit, Vec2,
 };
 use bevy_egui::egui::{text::LayoutJob, text_edit::CCursorRange};
 use bevy_egui::egui::{Context, Id};
@@ -321,7 +321,8 @@ pub(crate) struct ConsoleState {
     pub(crate) scrollback: Vec<StyledStr>,
     pub(crate) history: VecDeque<StyledStr>,
     pub(crate) history_index: usize,
-    pub(crate) selected_index: Option<usize>,
+    pub(crate) autocomplete_selected_index: Option<(usize, String)>,
+    pub(crate) autocomplete_popup: bool,
 }
 
 impl Default for ConsoleState {
@@ -331,7 +332,8 @@ impl Default for ConsoleState {
             scrollback: Vec::new(),
             history: VecDeque::from([StyledStr::new()]),
             history_index: 0,
-            selected_index: None,
+            autocomplete_selected_index: None,
+            autocomplete_popup: false,
         }
     }
 }
@@ -408,7 +410,7 @@ pub(crate) fn console_ui(
 
                 let matcher = SkimMatcherV2::default().ignore_case();
 
-                let text_edit_ui = ui.next_auto_id();
+                let text_edit_ui = ui.make_persistent_id("text_edit_ui");
 
                 let mut layouter = |ui: &egui::Ui, string: &str, _wrap_width: f32| {
                     if string.is_empty() {
@@ -464,7 +466,53 @@ pub(crate) fn console_ui(
 
                 let text_edit_response = ui.add(text_edit);
 
-                if text_edit_response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                let popup_id = ui.make_persistent_id("text_edit_popup");
+                egui::popup::popup_below_widget(ui, popup_id, &text_edit_response, |ui| {
+                    let mut match_results = possible_commands
+                        .iter()
+                        .filter_map(|s| {
+                            let score = matcher.fuzzy_indices(s, &state.buf);
+                            score.map(|(score, indices)| (s, score, indices))
+                        })
+                        .collect::<Vec<_>>();
+                    match_results.sort_by_key(|k| Reverse(k.1));
+                    if !match_results.is_empty() {
+                        for (suggestion_index, suggestion) in match_results.iter().enumerate() {
+                            if let Some(index) = state.autocomplete_selected_index.as_ref() {
+                                if suggestion_index == index.0 {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{}: {}",
+                                            suggestion.0, suggestion.1
+                                        ))
+                                        .color(Color32::from_rgb(255 / 2, 255 / 2, 255)),
+                                    );
+                                    state.autocomplete_selected_index =
+                                        Some((suggestion_index, suggestion.0.clone()));
+                                } else {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{}: {}",
+                                            suggestion.0, suggestion.1
+                                        ))
+                                        .color(Color32::from_rgb(255 / 2, 255 / 2, 255 / 2)),
+                                    );
+                                }
+                            } else {
+                                ui.label(
+                                    RichText::new(format!("{}: {}", suggestion.0, suggestion.1))
+                                        .color(Color32::from_rgb(255, 255, 255)),
+                                );
+                            }
+                        }
+                    } else {
+                        ui.label("❌ No suggestions");
+                    }
+                });
+
+                if text_edit_response.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    && state.autocomplete_selected_index.is_none()
                 {
                     if state.buf.trim().is_empty() {
                         state.scrollback.push(StyledStr::new());
@@ -498,60 +546,124 @@ pub(crate) fn console_ui(
                         }
 
                         state.buf.clear();
+
+                        state.autocomplete_selected_index = None;
+                        ui.memory_mut(|mem| {
+                            if mem.is_popup_open(popup_id) {
+                                mem.close_popup()
+                            }
+                        });
                     }
                 }
 
-                if text_edit_response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Tab)) {
-                    let mut match_results = possible_commands
-                        .iter()
-                        .filter_map(|s| {
-                            let score = matcher.fuzzy_indices(s, &state.buf);
-                            score.map(|(score, indices)| (s, score, indices))
-                        })
-                        .collect::<Vec<_>>();
-                    match_results.sort_by_key(|k| Reverse(k.1));
+                if text_edit_response.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    && state.autocomplete_selected_index.is_some()
+                {
+                    state.buf = state
+                        .autocomplete_selected_index
+                        .as_ref()
+                        .unwrap()
+                        .1
+                        .clone();
 
-                    state.buf = match_results.first().unwrap().0.to_string();
-                    set_cursor_pos(ui.ctx(), text_edit_ui, state.buf.len());
+                    state.autocomplete_popup = false;
+                    // state.autocomplete_selected_index = None;
                 }
 
+                if text_edit_response.has_focus()
+                    && state.buf.len() != 0
+                    && state.buf.len()
+                        != state
+                            .autocomplete_selected_index
+                            .as_ref()
+                            .unwrap_or(&(0, String::new()))
+                            .1
+                            .len()
+                {
+                    state.autocomplete_popup = true;
+                    ui.memory_mut(|mem| mem.open_popup(popup_id));
+                } else {
+                    state.autocomplete_popup = false;
+                    ui.memory_mut(|mem| {
+                        if mem.is_popup_open(popup_id) {
+                            mem.close_popup()
+                        }
+                    });
+                }
                 // Clear on ctrl+l
                 if keyboard_input_events
                     .iter()
                     .any(|&k| k.state.is_pressed() && k.key_code == Some(KeyCode::L))
                     && (keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]))
                 {
+                    state.autocomplete_popup = false;
                     state.scrollback.clear();
                 }
 
-                // Handle up and down through history
-                // if text_edit_response.has_focus()
-                //     && ui.input(|i| i.key_pressed(egui::Key::ArrowUp))
-                //     && state.history.len() > 1
-                //     && state.history_index < state.history.len() - 1
-                // {
-                //     if state.history_index == 0 && !state.buf.trim().is_empty() {
-                //         *state.history.get_mut(0).unwrap() = state.buf.clone().into();
-                //     }
+                if state.autocomplete_popup {
+                    let current_selected_value = state.autocomplete_selected_index.as_ref();
+                    // Handle up and down through suggestions
+                    if text_edit_response.has_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::ArrowUp))
+                    {
+                        if state.autocomplete_selected_index.is_none() {
+                            state.autocomplete_selected_index = Some((0, String::new()));
+                        } else {
+                            let current_value = current_selected_value.unwrap().0;
+                            if current_value == 0 {
+                                state.autocomplete_selected_index = None;
+                            } else {
+                                state.autocomplete_selected_index =
+                                    Some((current_value.saturating_sub(1), String::new()));
+                            }
+                        }
+                    } else if text_edit_response.has_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::ArrowDown))
+                    {
+                        if state.autocomplete_selected_index.is_none() {
+                            state.autocomplete_selected_index = Some((0, String::new()));
+                        } else {
+                            let current_value = current_selected_value.unwrap().0;
+                            state.autocomplete_selected_index =
+                                Some((current_value.saturating_add(1), String::new()));
+                        }
+                    }
+                } else {
+                    ui.memory_mut(|mem| {
+                        if mem.is_popup_open(popup_id) {
+                            mem.close_popup()
+                        }
+                    });
+                    // Handle up and down through history
+                    if text_edit_response.has_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::ArrowUp))
+                        && state.history.len() > 1
+                        && state.history_index < state.history.len() - 1
+                    {
+                        if state.history_index == 0 && !state.buf.trim().is_empty() {
+                            *state.history.get_mut(0).unwrap() = state.buf.clone().into();
+                        }
 
-                //     state.history_index += 1;
-                //     let previous_item = state.history.get(state.history_index).unwrap().clone();
-                //     state.buf = previous_item.to_string();
+                        state.history_index += 1;
+                        let previous_item = state.history.get(state.history_index).unwrap().clone();
+                        state.buf = previous_item.to_string();
 
-                //     set_cursor_pos(ui.ctx(), text_edit_response.id, state.buf.len());
-                // } else if text_edit_response.has_focus()
-                //     && ui.input(|i| i.key_pressed(egui::Key::ArrowDown))
-                //     && state.history_index > 0
-                // {
-                //     state.history_index -= 1;
-                //     let next_item = state.history.get(state.history_index).unwrap().clone();
-                //     state.buf = next_item.to_string();
+                        set_cursor_pos(ui.ctx(), text_edit_response.id, state.buf.len());
+                    } else if text_edit_response.has_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::ArrowDown))
+                        && state.history_index > 0
+                    {
+                        state.history_index -= 1;
+                        let next_item = state.history.get(state.history_index).unwrap().clone();
+                        state.buf = next_item.to_string();
 
-                //     set_cursor_pos(ui.ctx(), text_edit_response.id, state.buf.len());
-                // }
+                        set_cursor_pos(ui.ctx(), text_edit_response.id, state.buf.len());
+                    }
+                }
 
                 // Focus on input
-                // ui.memory_mut(|m| m.request_focus(text_edit_response.id));
+                ui.memory_mut(|m| m.request_focus(text_edit_response.id));
             });
         });
 }
