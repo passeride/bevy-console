@@ -6,7 +6,6 @@ use bevy::{
         system::{Resource, SystemMeta, SystemParam},
         world::unsafe_world_cell::UnsafeWorldCell,
     },
-    ui,
 };
 use bevy::{input::keyboard::KeyboardInput, prelude::*};
 use bevy_egui::egui::{
