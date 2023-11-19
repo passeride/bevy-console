@@ -1,16 +1,12 @@
-use bevy::{
-    app::AppLabel,
-    ecs::{
-        component::Tick,
-        schedule::IntoSystemConfigs,
-        system::{Resource, SystemMeta, SystemParam},
-        world::unsafe_world_cell::UnsafeWorldCell,
-    },
+use bevy::ecs::{
+    component::Tick,
+    schedule::IntoSystemConfigs,
+    system::{Resource, SystemMeta, SystemParam},
+    world::unsafe_world_cell::UnsafeWorldCell,
 };
+use bevy::prelude::Event;
 use bevy::{input::keyboard::KeyboardInput, prelude::*};
-use bevy_egui::egui::{
-    self, popup_below_widget, Align, Layout, Pos2, Rect, RichText, ScrollArea, TextEdit, Vec2,
-};
+use bevy_egui::egui::{self, Align, RichText, ScrollArea, TextEdit};
 use bevy_egui::egui::{text::LayoutJob, text_edit::CCursorRange};
 use bevy_egui::egui::{Context, Id};
 use bevy_egui::{
@@ -198,15 +194,15 @@ pub struct ConsoleCommandEntered {
 }
 
 /// Events to print to the console.
-#[derive(Clone, Debug, Eq, Event, PartialEq)]
+#[derive(Clone, Debug, Eq, bevy::prelude::Event, PartialEq)]
 pub struct PrintConsoleLine {
     /// Console line
     pub line: StyledStr,
 }
 
 impl PrintConsoleLine {
-    /// Creates a new console line to print.
-    pub const fn new(line: StyledStr) -> Self {
+    /// Create a new console line.
+    pub fn new(line: StyledStr) -> Self {
         Self { line }
     }
 }
